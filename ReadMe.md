@@ -1,3 +1,3 @@
-**Auxiliary-Field Quantum Monte Carlo simulation on H$$_2$$.** (buggy code)
+**Auxiliary-Field Quantum Monte Carlo simulation on H2 molecule (buggy code)
 
 ![Figure_1](demo.png)
