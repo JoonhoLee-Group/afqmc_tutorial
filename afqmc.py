@@ -1,4 +1,4 @@
-from pyscf import tools, lo, scf
+from pyscf import tools, lo, scf, fci
 import numpy as np
 import scipy
 import itertools
@@ -86,6 +86,9 @@ class afqmc_main(object):
         xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
         self.trial = mf.mo_coeff
         self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
+        # FCI reference
+        cisolver = fci.FCI(mf)
+        print('E(FCI) = %.12f' % cisolver.kernel()[0])
 
     def init_walker(self):
         self.get_trial()
@@ -116,8 +119,10 @@ class afqmc_main(object):
             trace_l_theta = np.einsum('znpp->zn', l_theta)
             # calculate the local energy for each walker
             local_e = self.local_energy(l_theta, h1e, v2e, nuc, trace_l_theta, green_func)
-            energy = sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
-            energy = energy / sum(self.walker_weight)
+            print(local_e)
+            energy = np.sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
+            energy = energy / np.sum(self.walker_weight)
+            print(energy)
             energy_list.append(energy)
             # imaginary time propagation
             xbar = -1j * np.sqrt(self.dt) * trace_l_theta
@@ -126,7 +131,6 @@ class afqmc_main(object):
             if int(time / self.dt) == 50:
                 self.reorthogonal()
             time = time + self.dt
-            print(f"energy: {energy_list[-1]}")
         return time_list, energy_list
 
     def get_overlap(self):
@@ -164,8 +168,8 @@ class afqmc_main(object):
         # local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
         # local_e2 = 0.5 * local_e2
         local_e1 = 2 * np.einsum("zpq, pq->z", green_func, h1e)
-        local_e = [ie + local_e1 + nuc for ie in local_e2]
-        return local_e
+        local_e = local_e1 + local_e2 + nuc
+        return np.real(local_e)
 
     def reorthogonal(self):
         ortho_walkers = np.zeros_like(self.walker_tensor)
