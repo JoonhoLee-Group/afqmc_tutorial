@@ -86,7 +86,6 @@ class afqmc_main(object):
         xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
         self.trial = mf.mo_coeff
         self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
-        # self.trial = xinv.dot(mf.mo_coeff)
 
     def init_walker(self):
         self.get_trial()
@@ -155,18 +154,16 @@ class afqmc_main(object):
         self.walker_weight = self.walker_weight * importance_func
 
     def local_energy(self, l_theta, h1e, v2e, nuc, trace_l_theta, green_func):
-        # trace_l_theta2 = trace_l_theta ** 2
-        # trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
-        # trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
-        #                                   l_theta, l_theta)
-        # local_e2 =  (trace_l_theta2 - trace_l_theta_l_theta)
-        local_e2 = np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
-        local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
-        local_e2 = 0.5 * local_e2
+        trace_l_theta2 = trace_l_theta ** 2
+        trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
+        trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
+                                          l_theta, l_theta)
+        local_e2 =  (trace_l_theta2 - trace_l_theta_l_theta)
+        # the following does not work, why? equal to zero.
+        # local_e2 = np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
+        # local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
+        # local_e2 = 0.5 * local_e2
         local_e1 = 2 * np.einsum("zpq, pq->z", green_func, h1e)
-        # delta_e = local_e1 - (-2.3907888081789515)
-        # local_e2 = local_e2 + delta_e
-        # local_e2 ref=0.6544390940702789
         local_e = [ie + local_e1 + nuc for ie in local_e2]
         return local_e
 
