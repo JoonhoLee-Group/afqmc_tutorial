@@ -79,7 +79,8 @@ class afqmc_main(object):
         mf.kernel()
         s_mat = self.mol.intor('int1e_ovlp')
         xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
-        self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
+        # self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
+        self.trial = xinv.dot(mf.mo_coeff)
 
     def init_walker(self):
         self.get_trial()
@@ -102,9 +103,10 @@ class afqmc_main(object):
             ovlp_inv = np.linalg.inv(ovlp)
             theta = np.einsum("zqp, zpr->zqr", self.walker_tensor, ovlp_inv)
             green_func = np.einsum("zqr, pr->zpq", theta, self.trial.conj())
-            trace_l_theta = self.force_bias(theta)
+            l_theta = np.einsum('npq, zqr->znpr', self.precomputed_l_tensor, theta)
+            trace_l_theta = np.einsum('znpp->zn', l_theta)
             # calculate the local energy for each walker
-            local_e = self.local_energy(theta, h1e, nuc, trace_l_theta, green_func)
+            local_e = self.local_energy(l_theta, h1e, nuc, trace_l_theta, green_func)
             energy = sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
             energy = energy / sum(self.walker_weight)
             energy_list.append(energy)
@@ -120,9 +122,6 @@ class afqmc_main(object):
 
     def get_overlap(self):
         return np.einsum('pr, zpq->zrq', self.trial.conj(), self.walker_tensor)
-
-    def force_bias(self, theta):
-        return np.einsum('zqr, nrq->zn', theta, self.precomputed_l_tensor)
 
     def propagate(self, h1e, xbar, ovlp, l_tensor):
         # 1-body propagator propagation
@@ -145,14 +144,13 @@ class afqmc_main(object):
         importance_func = np.abs(ovlp_ratio * i_factor) * phase_factor
         self.walker_weight = self.walker_weight * importance_func
 
-    def local_energy(self, theta, h1e, nuc, trace_l_theta, green_func):
+    def local_energy(self, l_theta, h1e, nuc, trace_l_theta, green_func):
         trace_l_theta2 = trace_l_theta ** 2
         trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
-        trace_l_theta_l_theta = np.einsum('nrq, zqp, nps, zsr->z',
-                                          self.precomputed_l_tensor, theta,
-                                          self.precomputed_l_tensor, theta)
+        trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
+                                          l_theta, l_theta)
         local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
-        local_e1 = np.sum(h1e * green_func)
+        local_e1 = np.einsum("zpq, pq->z", green_func, h1e)
         local_e = [ie + local_e1 + nuc for ie in local_e2]
         return local_e
 
