@@ -36,8 +36,15 @@ def read_fcidump(fname, norb):
                 h1e[q-1, p-1] = integral
             else:
                 nuc = integral
-
     return h1e, v2e, nuc
+
+
+def hartree_fock_energy(h1e, v2e, nuc, mo_coeff):
+    one_body_energy = 2 * np.einsum('ia, ja, ij->', mo_coeff, mo_coeff, h1e)
+    two_body_energy = 2 * np.einsum("ia, ja, kb, lb, ijkl->", mo_coeff, mo_coeff, mo_coeff, mo_coeff, v2e) - \
+        np.einsum("ia, jb, kb, la, ijkl->", mo_coeff, mo_coeff, mo_coeff, mo_coeff, v2e)
+    total_energy = one_body_energy + two_body_energy + nuc
+    return total_energy
 
 
 class afqmc_main(object):
@@ -61,17 +68,15 @@ class afqmc_main(object):
         import tempfile
         ftmp = tempfile.NamedTemporaryFile()
         tools.fcidump.from_mo(self.mol, ftmp.name, ao_coeff)
-        h1e, v2e, nuc = read_fcidump(ftmp.name, norb)
-        for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
-            h1e[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
+        h1e, eri, nuc = read_fcidump(ftmp.name, norb)
         # Cholesky decomposition
-        v2e = v2e.reshape((norb**2, -1))
+        v2e = eri.reshape((norb**2, -1))
         u, s, v = scipy.linalg.svd(v2e)
         l_tensor = u * np.sqrt(s)
         l_tensor = l_tensor.T
         l_tensor = l_tensor.reshape(l_tensor.shape[0], norb, norb)
         self.nfields = l_tensor.shape[0]
-        return h1e, nuc, l_tensor
+        return h1e, eri, nuc, l_tensor
 
     def get_trial(self):
         # RHF
@@ -79,8 +84,9 @@ class afqmc_main(object):
         mf.kernel()
         s_mat = self.mol.intor('int1e_ovlp')
         xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
-        # self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
-        self.trial = xinv.dot(mf.mo_coeff)
+        self.trial = mf.mo_coeff
+        self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
+        # self.trial = xinv.dot(mf.mo_coeff)
 
     def init_walker(self):
         self.get_trial()
@@ -90,7 +96,11 @@ class afqmc_main(object):
 
     def simulate_afqmc(self):
         self.init_walker()
-        h1e, nuc, l_tensor = self.hamiltonian_integral()
+        h1e, v2e, nuc, l_tensor = self.hamiltonian_integral()
+        hf_energy = hartree_fock_energy(h1e, v2e, nuc, self.trial)
+        print(f"the Hartree-Fock energy is {hf_energy}")
+        # for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
+        #     h1e[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
         self.precomputed_l_tensor = np.einsum("pr, npq->nrq", self.trial.conj(), l_tensor)
         time = 0
         energy_list = []
@@ -106,7 +116,7 @@ class afqmc_main(object):
             l_theta = np.einsum('npq, zqr->znpr', self.precomputed_l_tensor, theta)
             trace_l_theta = np.einsum('znpp->zn', l_theta)
             # calculate the local energy for each walker
-            local_e = self.local_energy(l_theta, h1e, nuc, trace_l_theta, green_func)
+            local_e = self.local_energy(l_theta, h1e, v2e, nuc, trace_l_theta, green_func)
             energy = sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
             energy = energy / sum(self.walker_weight)
             energy_list.append(energy)
@@ -144,13 +154,19 @@ class afqmc_main(object):
         importance_func = np.abs(ovlp_ratio * i_factor) * phase_factor
         self.walker_weight = self.walker_weight * importance_func
 
-    def local_energy(self, l_theta, h1e, nuc, trace_l_theta, green_func):
-        trace_l_theta2 = trace_l_theta ** 2
-        trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
-        trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
-                                          l_theta, l_theta)
-        local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
-        local_e1 = np.einsum("zpq, pq->z", green_func, h1e)
+    def local_energy(self, l_theta, h1e, v2e, nuc, trace_l_theta, green_func):
+        # trace_l_theta2 = trace_l_theta ** 2
+        # trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
+        # trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
+        #                                   l_theta, l_theta)
+        # local_e2 =  (trace_l_theta2 - trace_l_theta_l_theta)
+        local_e2 = np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
+        local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
+        local_e2 = 0.5 * local_e2
+        local_e1 = 2 * np.einsum("zpq, pq->z", green_func, h1e)
+        # delta_e = local_e1 - (-2.3907888081789515)
+        # local_e2 = local_e2 + delta_e
+        # local_e2 ref=0.6544390940702789
         local_e = [ie + local_e1 + nuc for ie in local_e2]
         return local_e
 
