@@ -154,11 +154,11 @@ class afqmc_main(object):
         self.walker_weight = self.walker_weight * importance_func
 
     def local_energy(self, l_theta, h1e, v2e, nuc, trace_l_theta, green_func):
-        trace_l_theta2 = trace_l_theta ** 2
-        trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
-        trace_l_theta_l_theta = np.einsum('znpr, znrp->z',
+        trace_l_theta2 = (2 * trace_l_theta) ** 2
+        trace_l_theta2 = np.einsum("zn->z", trace_l_theta2)
+        trace_l_theta_l_theta = 2 * np.einsum('znpr, znrp->z',
                                           l_theta, l_theta)
-        local_e2 =  (trace_l_theta2 - trace_l_theta_l_theta)
+        local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
         # the following does not work, why? equal to zero.
         # local_e2 = np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
         # local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
