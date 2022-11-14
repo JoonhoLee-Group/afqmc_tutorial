@@ -1,6 +1,7 @@
-from pyscf import gto, tools, lo, scf
+from pyscf import tools, lo, scf
 import numpy as np
 import scipy
+import itertools
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,7 @@ def read_fcidump(fname, norb):
 
     :param fname: electron integrals dumped by pyscf
     :param norb: number of orbitals
-    :return: electron integrals for 2nd quantization
+    :return: electron integrals for 2nd quantization with chemist's notation
     """
     v2e = np.zeros((norb, norb, norb, norb))
     h1e = np.zeros((norb, norb))
@@ -25,6 +26,7 @@ def read_fcidump(fname, norb):
             integral = float(line_content[0])
             p, q, r, s = [int(i_index) for i_index in line_content[1:5]]
             if r != 0:
+                # v2e[p,q,r,s] is with chemist notation (pq|rs)=(qp|rs)=(pq|sr)=(qp|sr)
                 v2e[p-1, q-1, r-1, s-1] = integral
                 v2e[q-1, p-1, r-1, s-1] = integral
                 v2e[p-1, q-1, s-1, r-1] = integral
@@ -56,13 +58,16 @@ class afqmc_main(object):
         s_mat = self.mol.intor('int1e_ovlp')
         ao_coeff = lo.orth.lowdin(s_mat)
         norb = ao_coeff.shape[0]
-        tools.fcidump.from_mo(self.mol, 'fcidump_lowdin.out', ao_coeff)
-        h1e, v2e, nuc = read_fcidump('fcidump_lowdin.out', norb)
-
+        import tempfile
+        ftmp = tempfile.NamedTemporaryFile()
+        tools.fcidump.from_mo(self.mol, ftmp.name, ao_coeff)
+        h1e, v2e, nuc = read_fcidump(ftmp.name, norb)
+        for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
+            h1e[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
         # Cholesky decomposition
-        v2e = np.moveaxis(v2e, 1, 2)
         v2e = v2e.reshape((norb**2, -1))
-        l_tensor = np.linalg.cholesky(v2e)
+        u, s, v = scipy.linalg.svd(v2e)
+        l_tensor = u * np.sqrt(s)
         l_tensor = l_tensor.T
         l_tensor = l_tensor.reshape(l_tensor.shape[0], norb, norb)
         self.nfields = l_tensor.shape[0]
@@ -73,8 +78,8 @@ class afqmc_main(object):
         mf = scf.RHF(self.mol)
         mf.kernel()
         s_mat = self.mol.intor('int1e_ovlp')
-        Xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
-        self.trial = Xinv.dot(mf.mo_coeff[:,:self.mol.nelec[0]])
+        xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
+        self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
 
     def init_walker(self):
         self.get_trial()
@@ -92,17 +97,21 @@ class afqmc_main(object):
         while time < self.total_t:
             print(f"time: {time}")
             time_list.append(time)
+            # tensors preparation
             ovlp = self.get_overlap()
             ovlp_inv = np.linalg.inv(ovlp)
             theta = np.einsum("zqp, zpr->zqr", self.walker_tensor, ovlp_inv)
+            green_func = np.einsum("zqr, pr->zpq", theta, self.trial.conj())
             trace_l_theta = self.force_bias(theta)
-            xbar = -1j * np.sqrt(self.dt) * trace_l_theta
-            local_e = self.local_energy(theta, h1e, nuc, trace_l_theta)
+            # calculate the local energy for each walker
+            local_e = self.local_energy(theta, h1e, nuc, trace_l_theta, green_func)
             energy = sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
             energy = energy / sum(self.walker_weight)
             energy_list.append(energy)
-            self.propagate(h1e, nuc, xbar, ovlp, l_tensor)
-            print(self.walker_weight)
+            # imaginary time propagation
+            xbar = -1j * np.sqrt(self.dt) * trace_l_theta
+            self.propagate(h1e, xbar, ovlp, l_tensor)
+            # periodic re-orthogonalization
             if int(time / self.dt) == 50:
                 self.reorthogonal()
             time = time + self.dt
@@ -110,14 +119,12 @@ class afqmc_main(object):
         return time_list, energy_list
 
     def get_overlap(self):
-        ovlp = np.einsum('pr, zpq->zrq', self.trial.conj(), self.walker_tensor)
-        return ovlp
+        return np.einsum('pr, zpq->zrq', self.trial.conj(), self.walker_tensor)
 
     def force_bias(self, theta):
-        bias = np.einsum('zqr, nrq->zn', theta, self.precomputed_l_tensor)
-        return bias
+        return np.einsum('zqr, nrq->zn', theta, self.precomputed_l_tensor)
 
-    def propagate(self, h1e, nuc, xbar, ovlp, l_tensor):
+    def propagate(self, h1e, xbar, ovlp, l_tensor):
         # 1-body propagator propagation
         one_body_op_power = scipy.linalg.expm(-self.dt * h1e)
         self.walker_tensor = np.einsum('pq, zqr->zpr', one_body_op_power, self.walker_tensor)
@@ -138,14 +145,14 @@ class afqmc_main(object):
         importance_func = np.abs(ovlp_ratio * i_factor) * phase_factor
         self.walker_weight = self.walker_weight * importance_func
 
-    def local_energy(self, theta, h1e, nuc, trace_l_theta):
+    def local_energy(self, theta, h1e, nuc, trace_l_theta, green_func):
         trace_l_theta2 = trace_l_theta ** 2
         trace_l_theta2 = 2 * np.einsum("zn->z", trace_l_theta2)
         trace_l_theta_l_theta = np.einsum('nrq, zqp, nps, zsr->z',
                                           self.precomputed_l_tensor, theta,
                                           self.precomputed_l_tensor, theta)
-        local_e2 = trace_l_theta2 - trace_l_theta_l_theta
-        local_e1 = np.sum(h1e) # *2
+        local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
+        local_e1 = np.sum(h1e * green_func)
         local_e = [ie + local_e1 + nuc for ie in local_e2]
         return local_e
 
