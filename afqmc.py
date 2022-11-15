@@ -129,8 +129,8 @@ class afqmc_main(object):
 
             self.propagate(h1e_, xbar, ovlp, l_tensor, local_e)
             # periodic re-orthogonalization
-            # if int(time / self.dt) == 10:
-            #     self.reorthogonal()
+            if int(time / self.dt) == 10:
+                self.reorthogonal()
             time = time + self.dt
         return time_list, energy_list
 

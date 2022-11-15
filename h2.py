@@ -10,7 +10,7 @@ mol = gto.M(
     verbose=5
 )
 
-total_t = 5
+total_t = 10
 afqmc_job = afqmc_main(mol, dt=0.01, total_t=total_t, nwalkers=1000)
 time, energy = afqmc_job.simulate_afqmc()
 
