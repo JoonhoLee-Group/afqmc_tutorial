@@ -86,24 +86,25 @@ class afqmc_main(object):
         xinv = np.linalg.inv(lo.orth.lowdin(s_mat))
         self.trial = mf.mo_coeff
         self.trial = xinv.dot(mf.mo_coeff[:, :self.mol.nelec[0]])
-        # FCI reference
-        cisolver = fci.FCI(mf)
-        print('E(FCI) = %.12f' % cisolver.kernel()[0])
 
     def init_walker(self):
         self.get_trial()
         temp = self.trial.copy()
         self.walker_tensor = np.array([temp] * self.nwalkers, dtype=np.complex128)
-        self.walker_weight = [1.] * self.nwalkers
+        self.walker_weight = np.array([1.] * self.nwalkers)
 
     def simulate_afqmc(self):
+        np.random.seed(47193717)
         self.init_walker()
         h1e, v2e, nuc, l_tensor = self.hamiltonian_integral()
+        h1e_ = np.zeros(h1e.shape)
         hf_energy = hartree_fock_energy(h1e, v2e, nuc, self.trial)
+        Gmf = self.trial.dot(self.trial.T.conj())
         print(f"the Hartree-Fock energy is {hf_energy}")
-        # for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
-        #     h1e[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
+        for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
+            h1e_[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
         self.precomputed_l_tensor = np.einsum("pr, npq->nrq", self.trial.conj(), l_tensor)
+        self.mf_shift = np.einsum("npq,pq->n",l_tensor,Gmf)
         time = 0
         energy_list = []
         time_list = []
@@ -119,26 +120,26 @@ class afqmc_main(object):
             trace_l_theta = np.einsum('znpp->zn', l_theta)
             # calculate the local energy for each walker
             local_e = self.local_energy(l_theta, h1e, v2e, nuc, trace_l_theta, green_func)
-            print(local_e)
             energy = np.sum([self.walker_weight[i]*local_e[i] for i in range(len(local_e))])
             energy = energy / np.sum(self.walker_weight)
-            print(energy)
             energy_list.append(energy)
             # imaginary time propagation
+            # xbar = -1j * np.sqrt(self.dt) * (trace_l_theta - self.mf_shift)
             xbar = -1j * np.sqrt(self.dt) * trace_l_theta
-            self.propagate(h1e, xbar, ovlp, l_tensor)
+
+            self.propagate(h1e_, nuc, xbar, ovlp, l_tensor)
             # periodic re-orthogonalization
-            if int(time / self.dt) == 50:
-                self.reorthogonal()
+            # if int(time / self.dt) == 10:
+            #     self.reorthogonal()
             time = time + self.dt
         return time_list, energy_list
 
     def get_overlap(self):
         return np.einsum('pr, zpq->zrq', self.trial.conj(), self.walker_tensor)
 
-    def propagate(self, h1e, xbar, ovlp, l_tensor):
+    def propagate(self, h1e_, nuc, xbar, ovlp, l_tensor):
         # 1-body propagator propagation
-        one_body_op_power = scipy.linalg.expm(-self.dt * h1e)
+        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_)
         self.walker_tensor = np.einsum('pq, zqr->zpr', one_body_op_power, self.walker_tensor)
 
         # 2-body propagator propagation
@@ -149,30 +150,39 @@ class afqmc_main(object):
         for order_i in range(1, 1+self.taylor_order):
             Temp = np.einsum('zpq, zqr->zpr', two_body_op_power, Temp) / order_i
             self.walker_tensor += Temp
+        # 1-body propagator propagation
+        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_)
+        self.walker_tensor = np.einsum('pq, zqr->zpr', one_body_op_power, self.walker_tensor)
 
+        # self.walker_tensor = np.exp(-self.dt * nuc) * self.walker_tensor
         ovlp_new = self.get_overlap()
         ovlp_ratio = np.linalg.det(ovlp_new) / np.linalg.det(ovlp)
+        # ovlp_ratio *= np.exp(np.einsum("zn, zn->z", xi, xbar)-0.5*np.einsum("zn, zn->z", xbar, xbar))
+        #cmf = np.exp(np.einsum("zn,n->z", xbar, self.mf_shift))
         phase_factor = np.array([max(0, np.cos(np.angle(i_ratio))) for i_ratio in ovlp_ratio])
-        i_factor = np.exp(np.einsum("zn, zn->z", xi, xbar)-0.5*np.einsum("zn, zn->z", xbar, xbar))
+        i_factor = np.exp(np.einsum("zn, zn->z", xi, xbar)-0.5*np.einsum("zn, zn->z", xbar, xbar))# * cmf
         importance_func = np.abs(ovlp_ratio * i_factor) * phase_factor
+        # importance_func = np.abs(ovlp_ratio) * phase_factor
         self.walker_weight = self.walker_weight * importance_func
 
     def local_energy(self, l_theta, h1e, v2e, nuc, trace_l_theta, green_func):
-        trace_l_theta2 = (2 * trace_l_theta) ** 2
-        trace_l_theta2 = np.einsum("zn->z", trace_l_theta2)
-        trace_l_theta_l_theta = 2 * np.einsum('znpr, znrp->z',
-                                          l_theta, l_theta)
-        local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
+        # trace_l_theta2 = (2 * trace_l_theta) ** 2
+        # trace_l_theta2 = np.einsum("zn->z", trace_l_theta2)
+        # trace_l_theta_l_theta = 2 * np.einsum('znpr, znrp->z',
+        #                                   l_theta, l_theta)
+        # local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
         # the following does not work, why? equal to zero.
-        # local_e2 = np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
-        # local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
-        # local_e2 = 0.5 * local_e2
+        local_e2 = 2. * np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
+        local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
+        ######## local_e2 = 0.5 * local_e2
         local_e1 = 2 * np.einsum("zpq, pq->z", green_func, h1e)
-        local_e = local_e1 + local_e2 + nuc
+        local_e = (local_e1 + local_e2 + nuc)
         return np.real(local_e)
 
     def reorthogonal(self):
         ortho_walkers = np.zeros_like(self.walker_tensor)
+
         for idx in range(self.walker_tensor.shape[0]):
+
             ortho_walkers[idx] = np.linalg.qr(self.walker_tensor[idx])[0]
         self.walker_tensor = ortho_walkers
