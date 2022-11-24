@@ -48,7 +48,7 @@ def hartree_fock_energy(h1e, v2e, nuc, mo_coeff):
 
 
 class afqmc_main(object):
-    def __init__(self, mol, dt, total_t, nwalkers=100, taylor_order=6):
+    def __init__(self, mol, dt, total_t, nwalkers=100, taylor_order=6, scheme='hybrid energy'):
         self.mol = mol
         self.nwalkers = nwalkers
         self.total_t = total_t
@@ -59,6 +59,9 @@ class afqmc_main(object):
         self.walker_weight = None
         self.precomputed_l_tensor = None
         self.taylor_order = taylor_order
+        self.hybrid_energy = None
+        self.mf_shift = None
+        self.scheme = scheme
 
     def hamiltonian_integral(self):
         # 1e & 2e integrals
@@ -97,14 +100,13 @@ class afqmc_main(object):
         np.random.seed(47193717)
         self.init_walker()
         h1e, v2e, nuc, l_tensor = self.hamiltonian_integral()
-        h1e_ = np.zeros(h1e.shape)
-        hf_energy = hartree_fock_energy(h1e, v2e, nuc, self.trial)
+        h1e_mod = np.zeros(h1e.shape)
         Gmf = self.trial.dot(self.trial.T.conj())
-        print(f"the Hartree-Fock energy is {hf_energy}")
+        self.mf_shift = 1j * np.einsum("npq,pq->n", l_tensor, Gmf)
         for p, q in itertools.product(range(h1e.shape[0]), repeat=2):
-            h1e_[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
+            h1e_mod[p, q] = h1e[p, q] - 0.5 * np.trace(v2e[p, :, :, q])
+        h1e_mod = h1e_mod - np.einsum("n, npq->pq", self.mf_shift, 1j*l_tensor)
         self.precomputed_l_tensor = np.einsum("pr, npq->nrq", self.trial.conj(), l_tensor)
-        self.mf_shift = np.einsum("npq,pq->n", l_tensor, Gmf)
         time = 0
         energy_list = []
         time_list = []
@@ -124,69 +126,75 @@ class afqmc_main(object):
             energy = energy / np.sum(self.walker_weight)
             energy_list.append(energy)
             # imaginary time propagation
-            # xbar = -1j * np.sqrt(self.dt) * (trace_l_theta - self.mf_shift)
-            xbar = -1j * 2 * np.sqrt(self.dt) * trace_l_theta
-
-            self.propagate(h1e_, xbar, ovlp, l_tensor, local_e)
+            xbar = -np.sqrt(self.dt) * (1j * 2 * trace_l_theta - self.mf_shift)
+            cfb, cmf = self.propagate(h1e_mod, xbar, l_tensor)
+            self.update_weight(ovlp, cfb, cmf, local_e, time)
             # periodic re-orthogonalization
-            if int(time / self.dt) == 10:
-                self.reorthogonal()
+            # if int(time / self.dt) == 10:
+            #     self.reorthogonal()
             time = time + self.dt
         return time_list, energy_list
 
     def get_overlap(self):
         return np.einsum('pr, zpq->zrq', self.trial.conj(), self.walker_tensor)
 
-    def propagate(self, h1e_, xbar, ovlp, l_tensor, local_e):
+    def propagate(self, h1e_mod, xbar, l_tensor):
         # 1-body propagator propagation
-        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_)
+        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_mod)
         self.walker_tensor = np.einsum('pq, zqr->zpr', one_body_op_power, self.walker_tensor)
-
         # 2-body propagator propagation
         xi = np.random.normal(0.0, 1.0, self.nfields * self.nwalkers)
         xi = xi.reshape(self.nwalkers, self.nfields)
-
-        # two_body_op_power = 1j * np.sqrt(self.dt) * np.einsum('zn, npq->zpq', xi-xbar, l_tensor)
-        # two_body_op_power = np.array([scipy.linalg.expm(itensor) for itensor in two_body_op_power])
-        # self.walker_tensor = np.einsum('zpq, zqr->zpr', two_body_op_power, self.walker_tensor)
         two_body_op_power = 1j * np.sqrt(self.dt) * np.einsum('zn, npq->zpq', xi-xbar, l_tensor)
         Temp = self.walker_tensor.copy()
         for order_i in range(1, 1+self.taylor_order):
             Temp = np.einsum('zpq, zqr->zpr', two_body_op_power, Temp) / order_i
             self.walker_tensor += Temp
-
         # 1-body propagator propagation
-        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_)
+        one_body_op_power = scipy.linalg.expm(-self.dt/2 * h1e_mod)
         self.walker_tensor = np.einsum('pq, zqr->zpr', one_body_op_power, self.walker_tensor)
-
         # self.walker_tensor = np.exp(-self.dt * nuc) * self.walker_tensor
+
+        cfb = np.einsum("zn, zn->z", xi, xbar)-0.5*np.einsum("zn, zn->z", xbar, xbar)
+        cmf = -np.sqrt(self.dt)*np.einsum('zn, n->z', xi-xbar, self.mf_shift)
+        return cfb, cmf
+
+    def update_weight(self, ovlp, cfb, cmf, local_e, time):
         ovlp_new = self.get_overlap()
-        ovlp_ratio = np.linalg.det(ovlp_new) / np.linalg.det(ovlp)
-        # cmf = np.exp(np.einsum("zn,n->z", xbar, self.mf_shift))
-        phase_factor = np.array([max(0, np.cos(np.angle(i_ratio))) for i_ratio in ovlp_ratio])
-        i_factor = np.exp(np.einsum("zn, zn->z", xi, xbar)-0.5*np.einsum("zn, zn->z", xbar, xbar))
-        # importance_func = np.abs(ovlp_ratio * i_factor) * phase_factor
-        # importance_func = ovlp_ratio * i_factor * phase_factor
-        importance_func = np.exp(-self.dt * np.real(local_e)) * phase_factor
+        # be cautious! power of 2 was neglected before.
+        ovlp_ratio = (np.linalg.det(ovlp_new) / np.linalg.det(ovlp))**2
+        # the hybrid energy scheme
+        if self.scheme == "hybrid energy":
+            self.ebound = (2.0 / self.dt) ** 0.5
+            hybrid_energy = -(np.log(ovlp_ratio) + cfb + cmf) / self.dt
+            hybrid_energy = np.clip(hybrid_energy.real, a_min=-self.ebound, a_max=self.ebound, out=hybrid_energy.real)
+            self.hybrid_energy = hybrid_energy if self.hybrid_energy is None else self.hybrid_energy
+            importance_func = np.exp(-self.dt * 0.5 * (hybrid_energy + self.hybrid_energy))
+            self.hybrid_energy = hybrid_energy
+            phase = (-self.dt * self.hybrid_energy-cfb).imag
+            phase_factor = np.array([max(0, np.cos(iphase)) for iphase in phase])
+            importance_func = np.abs(importance_func) * phase_factor
+
+        # The local energy formalism
+        if self.scheme == "local energy":
+            ovlp_ratio = ovlp_ratio * np.exp(cmf)
+            phase_factor = np.array([max(0, np.cos(np.angle(iovlp))) for iovlp in ovlp_ratio])
+            importance_func = np.exp(-self.dt * np.real(local_e)) * phase_factor
         self.walker_weight = self.walker_weight * importance_func
 
     def local_energy(self, l_theta, h1e, v2e, nuc, trace_l_theta, green_func):
-        trace_l_theta2 = (2 * trace_l_theta) ** 2
-        trace_l_theta2 = np.einsum("zn->z", trace_l_theta2)
-        trace_l_theta_l_theta = 2 * np.einsum('znpr, znrp->z',
-                                          l_theta, l_theta)
-        local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
-        # local_e2 = 2. * np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
-        # local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
-        ######## local_e2 = 0.5 * local_e2
+        # trace_l_theta2 = (2 * trace_l_theta) ** 2
+        # trace_l_theta2 = np.einsum("zn->z", trace_l_theta2)
+        # trace_l_theta_l_theta = 2 * np.einsum('znpr, znrp->z', l_theta, l_theta)
+        # local_e2 = 0.5 * (trace_l_theta2 - trace_l_theta_l_theta)
+        local_e2 = 2. * np.einsum("prqs, zpr, zqs->z", v2e, green_func, green_func)
+        local_e2 -= np.einsum("prqs, zps, zqr->z", v2e, green_func, green_func)
         local_e1 = 2 * np.einsum("zpq, pq->z", green_func, h1e)
         local_e = (local_e1 + local_e2 + nuc)
         return local_e
 
     def reorthogonal(self):
         ortho_walkers = np.zeros_like(self.walker_tensor)
-
         for idx in range(self.walker_tensor.shape[0]):
-
             ortho_walkers[idx] = np.linalg.qr(self.walker_tensor[idx])[0]
         self.walker_tensor = ortho_walkers
